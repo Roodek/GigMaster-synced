@@ -5,7 +5,7 @@ import react from '@vitejs/plugin-react';
 export default defineConfig({
   plugins: [react()],
   // This base path must match your GitHub repository name
-  base: '/gigMaster/',
+  base: '/GigMaster-synced/',
   build: {
     outDir: 'dist',
     assetsDir: 'assets',
