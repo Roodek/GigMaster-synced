@@ -1,6 +1,6 @@
 
 import React, { useState, useEffect, useRef, useCallback, useLayoutEffect } from 'react';
-import { PenTool, Eraser, X, Loader2, List, ChevronRight, ChevronLeft, Hash, ArrowRight, ChevronDown, BookOpen, RotateCcw, Type, Square, Circle, Search, Check, ChevronUp, Type as TypeIcon } from 'lucide-react';
+import { PenTool, Eraser, X, Loader2, List, ChevronRight, ChevronLeft, Hash, ArrowRight, ChevronDown, BookOpen, RotateCcw, Type, Square, Circle, Search, Check, ChevronUp, Type as TypeIcon, Clock } from 'lucide-react';
 import { Stroke, Point, Sheet, AnnotationType } from '../types';
 import { storage } from '../services/storage';
 import { COLORS, PAGE_TURN_KEYS } from '../constants';
@@ -82,6 +82,30 @@ const Viewer: React.FC<ViewerProps> = ({
   const [showJumpDropdown, setShowJumpDropdown] = useState(false);
   const [dimensions, setDimensions] = useState({ width: 1000, height: 1400 });
   const [displayScale, setDisplayScale] = useState(1);
+
+  // Gig Timer State
+  const [timerActive, setTimerActive] = useState(false);
+  const [timeElapsed, setTimeElapsed] = useState(0);
+
+  const formatTime = (secs: number) => {
+    const mins = Math.floor(secs / 60);
+    const remainingSecs = secs % 60;
+    return `${mins.toString().padStart(2, '0')}:${remainingSecs.toString().padStart(2, '0')}`;
+  };
+
+  useEffect(() => {
+    let interval: any = null;
+    if (timerActive) {
+      interval = setInterval(() => {
+        setTimeElapsed(prev => prev + 1);
+      }, 1000);
+    } else {
+      if (interval) clearInterval(interval);
+    }
+    return () => {
+      if (interval) clearInterval(interval);
+    };
+  }, [timerActive]);
 
   // Stability Refs
   const pdfDocCache = useRef<Map<number, any>>(new Map());
@@ -546,6 +570,13 @@ const Viewer: React.FC<ViewerProps> = ({
              </div>
         </div>
         <div className="flex items-center gap-2">
+             <button 
+               onClick={(e) => { e.stopPropagation(); setTimerActive(!timerActive); }} 
+               className={`p-3 rounded-xl transition-all ${timerActive ? 'bg-emerald-600 text-white shadow-lg scale-105 animate-pulse' : 'bg-white/10 text-white hover:bg-white/20'}`}
+               title="Toggle gig timer"
+             >
+               <Clock size={20} />
+             </button>
              <button onClick={() => { setIsAnnotating(!isAnnotating); if (!isAnnotating && currentTool === 'eraser') setCurrentTool('path'); }} className={`p-3 rounded-xl transition-all ${isAnnotating && currentTool !== 'eraser' ? 'bg-blue-600 text-white shadow-lg' : 'bg-white/10 text-white'}`}><PenTool size={20} /></button>
              <button onClick={() => { setCurrentTool('eraser'); setIsAnnotating(true); }} className={`p-3 rounded-xl transition-all ${isAnnotating && currentTool === 'eraser' ? 'bg-blue-600 text-white shadow-lg' : 'bg-white/10 text-white'}`}><Eraser size={20} /></button>
              <button onClick={(e) => { e.stopPropagation(); setShowQueue(!showQueue); }} className={`p-3 rounded-xl transition-colors ${showQueue ? 'bg-blue-600 text-white' : 'bg-white/10 text-white'}`}><List size={20} /></button>
@@ -711,6 +742,29 @@ const Viewer: React.FC<ViewerProps> = ({
                       <button key={idx} onClick={() => { onJumpTo(idx); setShowQueue(false); }} className={`w-full flex items-center gap-3 px-4 py-3 hover:bg-white/5 transition-colors text-left ${idx === currentQueueIndex ? 'bg-blue-600/20 text-blue-400 border-l-4 border-blue-500' : 'text-slate-300'}`}><span className="text-[10px] font-mono text-slate-500 w-4">{idx + 1}</span><span className="text-sm font-medium truncate flex-1">{item.name}</span></button>
                   ))}
               </div>
+          </div>
+      )}
+
+      {/* Gig Timer Display - Bottom Left Corner */}
+      {(timeElapsed > 0 || timerActive) && (
+          <div 
+              className="absolute bottom-6 left-6 z-[45] bg-slate-900/95 border border-white/15 rounded-lg px-3 py-1.5 shadow-2xl backdrop-blur-md text-white font-mono text-sm tracking-wider flex items-center gap-2 pointer-events-auto cursor-pointer group hover:bg-slate-800 hover:border-white/20 transition-all select-none"
+              onClick={(e) => {
+                  e.stopPropagation();
+                  setTimerActive(!timerActive);
+              }}
+              onDoubleClick={(e) => {
+                  e.stopPropagation();
+                  setTimerActive(false);
+                  setTimeElapsed(0);
+              }}
+              title="Click to pause/play, Double-click to reset"
+          >
+              <Clock size={14} className={`${timerActive ? 'text-emerald-400 animate-spin [animation-duration:8s]' : 'text-slate-400'}`} />
+              <span className="font-bold">{formatTime(timeElapsed)}</span>
+              {!timerActive && (
+                  <span className="text-[9px] text-slate-400 font-sans tracking-normal bg-white/5 px-1 py-0.5 rounded uppercase">Paused</span>
+              )}
           </div>
       )}
     </div>
