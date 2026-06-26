@@ -2,15 +2,7 @@ const CACHE_NAME = 'gigmaster-v1';
 const ASSETS_TO_CACHE = [
   './',
   'index.html',
-  'manifest.json',
-  'https://cdn.tailwindcss.com',
-  'https://esm.sh/react@^19.2.1/',
-  'https://esm.sh/react@^19.2.1',
-  'https://esm.sh/lucide-react@^0.559.0',
-  'https://esm.sh/react-dom@^19.2.1/',
-  'https://esm.sh/pdfjs-dist@3.11.174',
-  'https://esm.sh/pdfjs-dist@3.11.174/',
-  'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js'
+  'manifest.json'
 ];
 
 // Install event: cache core assets
