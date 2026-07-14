@@ -1,7 +1,8 @@
 {
   "name": "GigMaster Sheet Music Reader",
   "short_name": "GigMaster",
-  "start_url": "./index.html",
+  "start_url": "/GigMaster-synced/index.html",
+  "scope": "/GigMaster-synced/",
   "display": "standalone",
   "background_color": "#0f172a",
   "theme_color": "#0f172a",
