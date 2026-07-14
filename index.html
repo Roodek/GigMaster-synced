@@ -11,7 +11,7 @@
     
     <title>GigMaster - Sheet Music Reader</title>
     
-    <link rel="manifest" href="/GigMaster-synced/assets/manifest-BrjI7WbN.json" />
+    <link rel="manifest" href="/GigMaster-synced/assets/manifest-CHDRYUI_.json" />
     <link rel="apple-touch-icon" href="https://cdn-icons-png.flaticon.com/512/125/125009.png" />
     
     <script src="https://cdn.tailwindcss.com"></script>
@@ -56,7 +56,7 @@
     <script>
       if ('serviceWorker' in navigator) {
         window.addEventListener('load', () => {
-          navigator.serviceWorker.register('./sw.js')
+          navigator.serviceWorker.register('/GigMaster-synced/sw.js')
             .then((registration) => {
               console.log('ServiceWorker registration successful with scope: ', registration.scope);
             })
