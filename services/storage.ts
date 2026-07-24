@@ -4,6 +4,8 @@ import { Sheet, Setlist, AnnotationLayer, SheetPage, TagDef } from '../types';
 
 class StorageService {
   private db: IDBDatabase | null = null;
+  private sheetCache: Map<string, Sheet> = new Map();
+  private annotationCache: Map<string, AnnotationLayer> = new Map();
 
   async init(): Promise<void> {
     return new Promise((resolve, reject) => {
@@ -41,6 +43,8 @@ class StorageService {
    */
   async clearDatabase(): Promise<void> {
     if (!this.db) await this.init();
+    this.sheetCache.clear();
+    this.annotationCache.clear();
     const stores = [STORES.SHEETS, STORES.SETLISTS, STORES.ANNOTATIONS];
     for (const storeName of stores) {
       await this.transaction(storeName, 'readwrite', (store) => store.clear());
@@ -69,11 +73,12 @@ class StorageService {
   // --- Sheets ---
 
   async addSheet(sheet: Sheet): Promise<void> {
+    this.sheetCache.set(sheet.id, sheet);
     await this.transaction(STORES.SHEETS, 'readwrite', (store) => store.put(sheet));
   }
 
   async updateSheetMetadata(sheet: Sheet): Promise<void> {
-    const existing = await this.transaction<Sheet>(STORES.SHEETS, 'readonly', (store) => store.get(sheet.id));
+    const existing = await this.getSheet(sheet.id);
     if (!existing) throw new Error('Sheet not found');
     
     const record: Sheet = { 
@@ -82,18 +87,31 @@ class StorageService {
       tags: sheet.tags,
       tagIcons: sheet.tagIcons
     };
+    this.sheetCache.set(sheet.id, record);
     await this.transaction(STORES.SHEETS, 'readwrite', (store) => store.put(record));
   }
 
   async getAllSheets(): Promise<Sheet[]> {
-    return this.transaction(STORES.SHEETS, 'readonly', (store) => store.getAll());
+    const sheets = await this.transaction<Sheet[]>(STORES.SHEETS, 'readonly', (store) => store.getAll());
+    if (sheets) {
+      sheets.forEach(s => this.sheetCache.set(s.id, s));
+    }
+    return sheets;
   }
 
   async getSheet(id: string): Promise<Sheet | undefined> {
-    return this.transaction<Sheet>(STORES.SHEETS, 'readonly', (store) => store.get(id));
+    if (this.sheetCache.has(id)) {
+      return this.sheetCache.get(id);
+    }
+    const sheet = await this.transaction<Sheet>(STORES.SHEETS, 'readonly', (store) => store.get(id));
+    if (sheet) {
+      this.sheetCache.set(id, sheet);
+    }
+    return sheet;
   }
 
   async deleteSheet(id: string): Promise<void> {
+    this.sheetCache.delete(id);
     await this.transaction(STORES.SHEETS, 'readwrite', (store) => store.delete(id));
     await this.deleteAnnotation(id);
     const setlists = await this.getAllSetlists();
@@ -122,14 +140,24 @@ class StorageService {
   // --- Annotations ---
 
   async saveAnnotation(sheetId: string, strokes: any[]): Promise<void> {
-    await this.transaction(STORES.ANNOTATIONS, 'readwrite', (store) => store.put({ sheetId, strokes }));
+    const layer = { sheetId, strokes };
+    this.annotationCache.set(sheetId, layer);
+    await this.transaction(STORES.ANNOTATIONS, 'readwrite', (store) => store.put(layer));
   }
 
   async getAnnotation(sheetId: string): Promise<AnnotationLayer | undefined> {
-    return this.transaction(STORES.ANNOTATIONS, 'readonly', (store) => store.get(sheetId));
+    if (this.annotationCache.has(sheetId)) {
+      return this.annotationCache.get(sheetId);
+    }
+    const layer = await this.transaction<AnnotationLayer>(STORES.ANNOTATIONS, 'readonly', (store) => store.get(sheetId));
+    if (layer) {
+      this.annotationCache.set(sheetId, layer);
+    }
+    return layer;
   }
 
   async deleteAnnotation(sheetId: string): Promise<void> {
+    this.annotationCache.delete(sheetId);
     await this.transaction(STORES.ANNOTATIONS, 'readwrite', (store) => store.delete(sheetId));
   }
 

@@ -1,4 +1,3 @@
-
 import React, { useState, useEffect, useRef, useCallback, useLayoutEffect } from 'react';
 import { PenTool, Eraser, X, Loader2, List, ChevronRight, ChevronLeft, Hash, ArrowRight, ChevronDown, BookOpen, RotateCcw, Type, Square, Circle, Search, Check, ChevronUp, Type as TypeIcon, Clock } from 'lucide-react';
 import { Stroke, Point, Sheet, AnnotationType } from '../types';
@@ -24,6 +23,130 @@ const FONTS = [
 ];
 
 const PRESET_FONT_SIZES = [12, 14, 16, 18, 20, 24, 28, 32, 40, 48, 64];
+
+// Persistent module-level caches for instant page turns across setlists and sheet navigation
+const globalPdfDocCache = new Map<string, any>();
+const globalCanvasCache = new Map<string, HTMLCanvasElement>();
+const globalNumPagesCache = new Map<string, number>();
+const globalImageUrlCache = new Map<string, string>();
+const activeRenderTasks = new Map<string, Promise<HTMLCanvasElement | null>>();
+
+async function getOrParsePdfDocGlobal(sheet: Sheet, fileIdx: number): Promise<any> {
+    if (!sheet || !sheet.pages || !sheet.pages[fileIdx]) return null;
+    const key = `${sheet.id}-${fileIdx}`;
+    if (globalPdfDocCache.has(key)) return globalPdfDocCache.get(key);
+    if (sheet.pages[fileIdx].fileType !== 'application/pdf') return null;
+
+    try {
+        const arrayBuffer = await sheet.pages[fileIdx].blob.arrayBuffer();
+        const doc = await pdfjs.getDocument({ data: new Uint8Array(arrayBuffer) }).promise;
+        globalPdfDocCache.set(key, doc);
+        globalNumPagesCache.set(key, doc.numPages);
+        return doc;
+    } catch (e) {
+        console.error("Error parsing PDF doc", e);
+        return null;
+    }
+}
+
+async function renderPdfPageToGlobalCache(sheet: Sheet, fileIdx: number, pageIdx: number): Promise<HTMLCanvasElement | null> {
+    if (!sheet || !sheet.pages || !sheet.pages[fileIdx]) return null;
+    const key = `${sheet.id}-${fileIdx}-${pageIdx}`;
+
+    if (globalCanvasCache.has(key)) {
+        return globalCanvasCache.get(key)!;
+    }
+
+    if (activeRenderTasks.has(key)) {
+        return activeRenderTasks.get(key)!;
+    }
+
+    const task = (async () => {
+        try {
+            const doc = await getOrParsePdfDocGlobal(sheet, fileIdx);
+            if (!doc) return null;
+            if (pageIdx < 0 || pageIdx >= doc.numPages) return null;
+
+            const page = await doc.getPage(pageIdx + 1);
+            const viewport = page.getViewport({ scale: 2 });
+            const offscreenCanvas = document.createElement('canvas');
+            offscreenCanvas.width = viewport.width;
+            offscreenCanvas.height = viewport.height;
+
+            await page.render({
+                canvasContext: offscreenCanvas.getContext('2d')!,
+                viewport
+            }).promise;
+
+            globalCanvasCache.set(key, offscreenCanvas);
+            return offscreenCanvas;
+        } catch (e) {
+            console.error(`Error rendering page ${key}`, e);
+            return null;
+        } finally {
+            activeRenderTasks.delete(key);
+        }
+    })();
+
+    activeRenderTasks.set(key, task);
+    return task;
+}
+
+function prefetchNeighborsGlobal(
+    currentSheet: Sheet,
+    fileIdx: number,
+    subPageIdx: number,
+    queue: { id: string; name: string }[],
+    currentQueueIndex: number
+) {
+    if (!currentSheet) return;
+    const docKey = `${currentSheet.id}-${fileIdx}`;
+    const totalSubPages = globalNumPagesCache.get(docKey) || 1;
+
+    // 1. Next page in current file
+    if (subPageIdx + 1 < totalSubPages) {
+        renderPdfPageToGlobalCache(currentSheet, fileIdx, subPageIdx + 1);
+    }
+    // 2. Previous page in current file
+    if (subPageIdx - 1 >= 0) {
+        renderPdfPageToGlobalCache(currentSheet, fileIdx, subPageIdx - 1);
+    }
+    // 3. 2 pages ahead
+    if (subPageIdx + 2 < totalSubPages) {
+        renderPdfPageToGlobalCache(currentSheet, fileIdx, subPageIdx + 2);
+    }
+
+    // 4. Next sheet in setlist queue
+    if (queue && currentQueueIndex < queue.length - 1) {
+        const nextId = queue[currentQueueIndex + 1].id;
+        storage.getSheet(nextId).then(nextSheet => {
+            if (nextSheet) {
+                renderPdfPageToGlobalCache(nextSheet, 0, 0);
+            }
+        });
+    }
+
+    // 5. Previous sheet in setlist queue
+    if (queue && currentQueueIndex > 0) {
+        const prevId = queue[currentQueueIndex - 1].id;
+        storage.getSheet(prevId).then(prevSheet => {
+            if (prevSheet) {
+                getOrParsePdfDocGlobal(prevSheet, 0).then(doc => {
+                    const lastPage = (doc?.numPages || 1) - 1;
+                    renderPdfPageToGlobalCache(prevSheet, 0, lastPage);
+                });
+            }
+        });
+    }
+}
+
+function getImageUrlCached(sheetId: string, fileIdx: number, blob: Blob): string {
+    const key = `${sheetId}-${fileIdx}`;
+    if (!globalImageUrlCache.has(key)) {
+        globalImageUrlCache.set(key, URL.createObjectURL(blob));
+    }
+    return globalImageUrlCache.get(key)!;
+}
 
 interface ViewerProps {
   sheetId: string;
@@ -108,9 +231,6 @@ const Viewer: React.FC<ViewerProps> = ({
   }, [timerActive]);
 
   // Stability Refs
-  const pdfDocCache = useRef<Map<number, any>>(new Map());
-  const canvasCache = useRef<Map<string, HTMLCanvasElement>>(new Map());
-  const renderTasks = useRef<Map<string, any>>(new Map());
   const containerRef = useRef<HTMLDivElement>(null);
   const pdfCanvasRef = useRef<HTMLCanvasElement>(null);
   const imageRef = useRef<HTMLImageElement>(null);
@@ -141,156 +261,148 @@ const Viewer: React.FC<ViewerProps> = ({
     return () => window.removeEventListener('resize', updateDisplayScale);
   }, [updateDisplayScale]);
 
-  useLayoutEffect(() => {
-    setLoading(true);
-    setSheet(null);
-    setNumSubPages(0);
-    setActiveFileIndex(0);
-    setSubPageIndex(initialDirection === 'backward' ? -1 : 0);
-    
-    pdfDocCache.current.clear();
-    canvasCache.current.clear();
-    renderTasks.current.forEach(task => { try { task.cancel(); } catch(e) {} });
-    renderTasks.current.clear();
-    
-    const ctx = pdfCanvasRef.current?.getContext('2d');
-    if (ctx && pdfCanvasRef.current) {
-        ctx.clearRect(0, 0, pdfCanvasRef.current.width, pdfCanvasRef.current.height);
+  const drawOffscreenToMainCanvas = useCallback((offscreenCanvas: HTMLCanvasElement) => {
+    const mainCanvas = pdfCanvasRef.current;
+    if (mainCanvas && offscreenCanvas) {
+      mainCanvas.width = offscreenCanvas.width;
+      mainCanvas.height = offscreenCanvas.height;
+      setDimensions({ width: offscreenCanvas.width, height: offscreenCanvas.height });
+      const ctx = mainCanvas.getContext('2d');
+      if (ctx) {
+        ctx.drawImage(offscreenCanvas, 0, 0);
+      }
+      setTimeout(updateDisplayScale, 0);
+      setLoading(false);
     }
+  }, [updateDisplayScale]);
 
-    currentViewRef.current = {
-      sheetId,
-      fileIndex: 0,
-      pageIndex: initialDirection === 'backward' ? -1 : 0
-    };
-  }, [sheetId, initialDirection]);
+  const displayCurrentPage = useCallback(async (
+    targetSheet: Sheet,
+    fileIdx: number,
+    pIdx: number
+  ) => {
+    if (!targetSheet) return;
+    const file = targetSheet.pages?.[fileIdx];
+    if (!file) return;
 
+    if (file.fileType === 'application/pdf') {
+      const doc = await getOrParsePdfDocGlobal(targetSheet, fileIdx);
+      if (!doc) {
+        setLoading(false);
+        return;
+      }
+
+      const totalPages = doc.numPages;
+      setNumSubPages(totalPages);
+
+      let actualPIdx = pIdx;
+      if (actualPIdx === -1) {
+        actualPIdx = totalPages - 1;
+        setSubPageIndex(actualPIdx);
+      }
+
+      const key = `${targetSheet.id}-${fileIdx}-${actualPIdx}`;
+
+      if (globalCanvasCache.has(key)) {
+        // INSTANT DRAW FROM PRE-RENDERED CANVAS
+        drawOffscreenToMainCanvas(globalCanvasCache.get(key)!);
+      } else {
+        setLoading(true);
+        const canvas = await renderPdfPageToGlobalCache(targetSheet, fileIdx, actualPIdx);
+        if (canvas) {
+          drawOffscreenToMainCanvas(canvas);
+        } else {
+          setLoading(false);
+        }
+      }
+
+      // Prefetch next/prev pages in background immediately
+      prefetchNeighborsGlobal(targetSheet, fileIdx, actualPIdx, queue, currentQueueIndex);
+    } else {
+      setNumSubPages(1);
+      setSubPageIndex(0);
+      setLoading(false);
+    }
+  }, [drawOffscreenToMainCanvas, queue, currentQueueIndex]);
+
+  // Initial Load & Sheet Sync
   useEffect(() => {
     let active = true;
     const load = async () => {
       try {
         const loaded = await storage.getSheet(sheetId);
-        if (!active || sheetId !== currentViewRef.current.sheetId) return;
+        if (!active) return;
 
         if (loaded) {
           const targetFileIdx = initialDirection === 'backward' ? Math.max(0, loaded.pages.length - 1) : 0;
-          currentViewRef.current.fileIndex = targetFileIdx;
+          currentViewRef.current = { sheetId, fileIndex: targetFileIdx, pageIndex: initialDirection === 'backward' ? -1 : 0 };
           setActiveFileIndex(targetFileIdx);
           setSheet(loaded);
-          
+
+          const startSubPage = initialDirection === 'backward' ? -1 : 0;
+          setSubPageIndex(startSubPage);
+
           const annotations = await storage.getAnnotation(sheetId);
-          if (active && sheetId === currentViewRef.current.sheetId) {
+          if (active) {
             setAllStrokes(annotations?.strokes || []);
           }
+
+          displayCurrentPage(loaded, targetFileIdx, startSubPage);
         } else {
-           onClose();
+          onClose();
         }
       } catch (err) {
         console.error("Load error", err);
       }
     };
+
     load();
     return () => { active = false; };
-  }, [sheetId, initialDirection, onClose]);
+  }, [sheetId, initialDirection, onClose, displayCurrentPage]);
 
-  const getPdfDoc = useCallback(async (fileIdx: number) => {
-    if (!sheet || !sheet.pages || !sheet.pages[fileIdx]) return null;
-    if (pdfDocCache.current.has(fileIdx)) return pdfDocCache.current.get(fileIdx);
-    if (sheet.pages[fileIdx].fileType !== 'application/pdf') return null;
-
-    try {
-        const arrayBuffer = await sheet.pages[fileIdx].blob.arrayBuffer();
-        const doc = await pdfjs.getDocument({ data: new Uint8Array(arrayBuffer) }).promise;
-        if (sheetId === currentViewRef.current.sheetId) {
-            pdfDocCache.current.set(fileIdx, doc);
-            return doc;
-        }
-        return null;
-    } catch (e) {
-        return null;
+  const turnPage = useCallback((dir: 1 | -1) => {
+    if (isPdf && dir === 1 && subPageIndex < numSubPages - 1) {
+      const nextSub = subPageIndex + 1;
+      setSubPageIndex(nextSub);
+      currentViewRef.current.pageIndex = nextSub;
+      if (sheet) {
+        displayCurrentPage(sheet, activeFileIndex, nextSub);
+      }
+    } else if (isPdf && dir === -1 && subPageIndex > 0) {
+      const prevSub = subPageIndex - 1;
+      setSubPageIndex(prevSub);
+      currentViewRef.current.pageIndex = prevSub;
+      if (sheet) {
+        displayCurrentPage(sheet, activeFileIndex, prevSub);
+      }
+    } else if (dir === 1 && sheet && activeFileIndex < sheet.pages.length - 1) {
+      const nextFile = activeFileIndex + 1;
+      setActiveFileIndex(nextFile);
+      setSubPageIndex(0);
+      currentViewRef.current.fileIndex = nextFile;
+      currentViewRef.current.pageIndex = 0;
+      displayCurrentPage(sheet, nextFile, 0);
+    } else if (dir === -1 && activeFileIndex > 0) {
+      const prevFile = activeFileIndex - 1;
+      setActiveFileIndex(prevFile);
+      setSubPageIndex(-1);
+      currentViewRef.current.fileIndex = prevFile;
+      currentViewRef.current.pageIndex = -1;
+      displayCurrentPage(sheet, prevFile, -1);
+    } else if (dir === 1 && hasNext) {
+      onNext();
+    } else if (dir === -1 && hasPrev) {
+      onPrev();
     }
-  }, [sheet, sheetId]);
+  }, [isPdf, subPageIndex, numSubPages, sheet, activeFileIndex, hasNext, hasPrev, onNext, onPrev, displayCurrentPage]);
 
-  const renderPage = useCallback(async (fIdx: number, pIdx: number, isPriority = false) => {
-    const key = `${sheetId}-${fIdx}-${pIdx}`;
-    
-    if (canvasCache.current.has(key)) {
-        if (isPriority) {
-            const cachedCanvas = canvasCache.current.get(key);
-            const mainCanvas = pdfCanvasRef.current;
-            if (mainCanvas && cachedCanvas) {
-                mainCanvas.width = cachedCanvas.width;
-                mainCanvas.height = cachedCanvas.height;
-                setDimensions({ width: cachedCanvas.width, height: cachedCanvas.height });
-                mainCanvas.getContext('2d')?.drawImage(cachedCanvas, 0, 0);
-                setTimeout(updateDisplayScale, 0);
-            }
-            setLoading(false);
-        }
-        return;
-    }
-
-    const doc = await getPdfDoc(fIdx);
-    if (!doc || sheetId !== currentViewRef.current.sheetId || fIdx !== currentViewRef.current.fileIndex) return;
-
-    try {
-        const page = await doc.getPage(pIdx + 1);
-        const viewport = page.getViewport({ scale: 2 });
-        const offscreenCanvas = document.createElement('canvas');
-        offscreenCanvas.width = viewport.width;
-        offscreenCanvas.height = viewport.height;
-        
-        const task = page.render({
-            canvasContext: offscreenCanvas.getContext('2d')!,
-            viewport
-        });
-
-        renderTasks.current.set(key, task);
-        await task.promise;
-        
-        if (sheetId === currentViewRef.current.sheetId && fIdx === currentViewRef.current.fileIndex) {
-            canvasCache.current.set(key, offscreenCanvas);
-            if (isPriority && pIdx === currentViewRef.current.pageIndex) {
-                const mainCanvas = pdfCanvasRef.current;
-                if (mainCanvas) {
-                    mainCanvas.width = offscreenCanvas.width;
-                    mainCanvas.height = offscreenCanvas.height;
-                    setDimensions({ width: offscreenCanvas.width, height: offscreenCanvas.height });
-                    mainCanvas.getContext('2d')?.drawImage(offscreenCanvas, 0, 0);
-                    setTimeout(updateDisplayScale, 0);
-                }
-                setLoading(false);
-            }
-        }
-    } catch (e) {
-        if (isPriority) setLoading(false);
-    }
-  }, [sheetId, getPdfDoc, updateDisplayScale]);
-
-  useEffect(() => {
+  const handleJumpToSubPage = (pIdx: number) => {
     if (!sheet) return;
-    const currentFile = sheet.pages[activeFileIndex];
-    if (!currentFile) return;
-
-    if (currentFile.fileType === 'application/pdf') {
-        getPdfDoc(activeFileIndex).then(doc => {
-            if (!doc || sheetId !== currentViewRef.current.sheetId) return;
-            setNumSubPages(doc.numPages);
-            if (subPageIndex === -1) {
-                const last = doc.numPages - 1;
-                currentViewRef.current.pageIndex = last;
-                setSubPageIndex(last);
-            } else {
-                renderPage(activeFileIndex, subPageIndex, true);
-            }
-        });
-    } else {
-        setNumSubPages(1);
-        setSubPageIndex(0);
-        currentViewRef.current.pageIndex = 0;
-        setLoading(false);
-    }
-  }, [sheet, activeFileIndex, subPageIndex, sheetId, getPdfDoc, renderPage]);
+    setSubPageIndex(pIdx);
+    currentViewRef.current.pageIndex = pIdx;
+    setShowJumpDropdown(false);
+    displayCurrentPage(sheet, activeFileIndex, pIdx);
+  };
 
   const handlePointerDown = (e: React.PointerEvent) => {
     if (!isAnnotating) return;
@@ -392,30 +504,6 @@ const Viewer: React.FC<ViewerProps> = ({
     }
     setTextInput(null);
   };
-
-  const turnPage = useCallback((dir: 1 | -1) => {
-    if (isPdf && dir === 1 && subPageIndex < numSubPages - 1) {
-        setSubPageIndex(prev => prev + 1);
-        currentViewRef.current.pageIndex++;
-    } else if (isPdf && dir === -1 && subPageIndex > 0) {
-        setSubPageIndex(prev => prev - 1);
-        currentViewRef.current.pageIndex--;
-    } else if (dir === 1 && sheet && activeFileIndex < sheet.pages.length - 1) {
-        setActiveFileIndex(prev => prev + 1);
-        setSubPageIndex(0);
-        currentViewRef.current.fileIndex++;
-        currentViewRef.current.pageIndex = 0;
-    } else if (dir === -1 && activeFileIndex > 0) {
-        setActiveFileIndex(prev => prev - 1);
-        setSubPageIndex(-1);
-        currentViewRef.current.fileIndex--;
-        currentViewRef.current.pageIndex = -1;
-    } else if (dir === 1 && hasNext) {
-        onNext();
-    } else if (dir === -1 && hasPrev) {
-        onPrev();
-    }
-  }, [isPdf, subPageIndex, numSubPages, sheet, activeFileIndex, hasNext, hasPrev, onNext, onPrev]);
 
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
@@ -533,7 +621,7 @@ const Viewer: React.FC<ViewerProps> = ({
                   />
               );
           case 'text':
-              const fs = width; // For text, width is the font size
+              const fs = width;
               return (
                   <text 
                     key={key}
@@ -567,6 +655,25 @@ const Viewer: React.FC<ViewerProps> = ({
                 >
                     {loading ? <span>Syncing...</span> : <span className="bg-white/5 px-2 py-1 rounded flex items-center gap-1.5">{currentDisplayPage} / {totalDisplayPages} <ChevronDown size={10}/></span>}
                 </button>
+
+                {/* Page Jump Dropdown */}
+                {showJumpDropdown && totalDisplayPages > 1 && (
+                  <div className="absolute top-full left-0 mt-2 w-48 bg-slate-900/98 backdrop-blur-2xl border border-white/10 rounded-2xl shadow-2xl py-2 z-[110]" onClick={e => e.stopPropagation()}>
+                    <div className="px-3 py-1 border-b border-white/5 text-[10px] font-black text-slate-500 uppercase tracking-widest">Jump to page</div>
+                    <div className="max-h-56 overflow-y-auto no-scrollbar py-1">
+                      {Array.from({ length: totalDisplayPages }, (_, i) => i).map((p) => (
+                        <button
+                          key={p}
+                          onClick={() => handleJumpToSubPage(p)}
+                          className={`w-full flex items-center justify-between px-4 py-2 hover:bg-white/10 text-xs text-left transition-colors ${p === subPageIndex ? 'text-blue-400 font-bold bg-blue-600/10' : 'text-slate-300'}`}
+                        >
+                          <span>Page {p + 1}</span>
+                          {p === subPageIndex && <Check size={14} />}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                )}
              </div>
         </div>
         <div className="flex items-center gap-2">
@@ -587,12 +694,12 @@ const Viewer: React.FC<ViewerProps> = ({
         {loading && (
             <div className="absolute inset-0 flex flex-col items-center justify-center bg-zinc-950 z-40">
                 <Loader2 className="animate-spin text-blue-500 mb-4" size={48} />
-                <p className="text-slate-500 text-xs font-black uppercase tracking-widest">Loading...</p>
+                <p className="text-slate-500 text-xs font-black uppercase tracking-widest">Loading Page...</p>
             </div>
         )}
-        <canvas ref={pdfCanvasRef} className={`max-w-full max-h-full object-contain shadow-2xl transition-opacity duration-300 pointer-events-none ${isPdf ? 'block' : 'hidden'}`} style={{ opacity: loading ? 0 : 1 }} />
+        <canvas ref={pdfCanvasRef} className={`max-w-full max-h-full object-contain shadow-2xl transition-opacity duration-150 pointer-events-none ${isPdf ? 'block' : 'hidden'}`} style={{ opacity: loading ? 0 : 1 }} />
         {!loading && sheet && currentFile && !isPdf && (
-            <img ref={imageRef} src={URL.createObjectURL(currentFile.blob)} className="max-w-full max-h-full object-contain shadow-2xl pointer-events-none" alt="Sheet Page" onLoad={() => { setTimeout(updateDisplayScale, 100); }} />
+            <img ref={imageRef} src={getImageUrlCached(sheetId, activeFileIndex, currentFile.blob)} className="max-w-full max-h-full object-contain shadow-2xl pointer-events-none" alt="Sheet Page" onLoad={() => { setTimeout(updateDisplayScale, 100); }} />
         )}
         {!loading && sheet && (
             <svg className="absolute inset-0 w-full h-full pointer-events-none z-10" viewBox={`0 0 ${dimensions.width} ${dimensions.height}`} preserveAspectRatio="none">
